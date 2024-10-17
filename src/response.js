@@ -20,7 +20,7 @@ const vary = require("vary");
 const encodeUrl = require("encodeurl");
 const { 
     normalizeType, stringify, deprecated, UP_PATH_REGEXP, decode,
-    containsDotFile, isPreconditionFailure, isRangeFresh, NullObject
+    containsDotFile, isPreconditionFailure, isRangeFresh, parseHttpDate
 } = require("./utils.js");
 const { Writable } = require("stream");
 const { isAbsolute } = require("path");
@@ -70,7 +70,7 @@ module.exports = class Response extends Writable {
         this._res = res;
         this.headersSent = false;
         this.app = app;
-        this.locals = new NullObject();
+        this.locals = {};
         this.finished = false;
         this.aborted = false;
         this.statusCode = 200;
@@ -209,8 +209,12 @@ module.exports = class Response extends Writable {
         // compatibility function
         // usually should send headers but this is useless for us
         this.writeHead(this.statusCode);
+        return;
     }
     status(code) {
+        if(this.headersSent) {
+            throw new Error('Can\'t set status: Response was already sent');
+        }
         this.statusCode = parseInt(code);
         return this;
     }
@@ -279,21 +283,23 @@ module.exports = class Response extends Writable {
         }
         if(typeof body === 'string') {
             const contentType = this.headers['content-type'];
-            if(contentType && !contentType.includes(';')) {
+            if(!contentType){
+                this.type('html'); // string defaulting to html
+            } else if(!contentType.includes(';')) {
                 this.headers['content-type'] += '; charset=utf-8';
             }
         }
         return this.end(body);
     }
-    sendFile(path, options = new NullObject(), callback) {
+    sendFile(path, options = {}, callback) {
         if(typeof path !== 'string') {
             throw new TypeError('path argument is required to res.sendFile');
         }
         if(typeof options === 'function') {
             callback = options;
-            options = new NullObject();
+            options = {};
         }
-        if(!options) options = new NullObject();
+        if(!options) options = {};
         let done = callback;
         if(!done) done = this.req.next;
         // default options
@@ -485,16 +491,16 @@ module.exports = class Response extends Writable {
     download(path, filename, options, callback) {
         let done = callback;
         let name = filename;
-        let opts = options || new NullObject();
+        let opts = options || {};
 
         // support function as second or third arg
         if (typeof filename === 'function') {
             done = filename;
             name = null;
-            opts = new NullObject();
+            opts = {};
         } else if (typeof options === 'function') {
             done = options;
-            opts = new NullObject();
+            opts = {};
         }
 
         // support optional filename, where options may be in it's place
@@ -515,7 +521,7 @@ module.exports = class Response extends Writable {
     }
     set(field, value) {
         if(this.headersSent) {
-            throw new Error('Cannot set headers after they are sent to the client');
+            throw new Error('Can\'t write headers: Response was already sent');
         }
         if(typeof field === 'object') {
             for(const header in field) {
@@ -574,10 +580,10 @@ module.exports = class Response extends Writable {
     render(view, options, callback) {
         if(typeof options === 'function') {
             callback = options;
-            options = new NullObject();
+            options = {};
         }
         if(!options) {
-            options = new NullObject();
+            options = {};
         } else {
             options = Object.assign({}, options);
         }
@@ -591,7 +597,7 @@ module.exports = class Response extends Writable {
     }
     cookie(name, value, options) {
         if(!options) {
-            options = new NullObject();
+            options = {};
         }
         let val = typeof value === 'object' ? "j:"+JSON.stringify(value) : String(value);
         if(options.maxAge != null) {
@@ -701,12 +707,10 @@ module.exports = class Response extends Writable {
     }
 
     type(type) {
-        let ct = type.indexOf('/') === -1
+        const ct = type.indexOf('/') === -1
             ? (mime.contentType(type) || 'application/octet-stream')
             : type;
-        if(ct.startsWith('text/') || ct === 'application/json' || ct === 'application/javascript') {
-            ct += '; charset=UTF-8';
-        }
+        
         return this.set('content-type', ct);
     }
     contentType(type) {
