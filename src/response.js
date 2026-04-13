@@ -72,8 +72,7 @@ module.exports = class Response extends Writable {
     #socket = null;
     #ended = false;
     #pendingChunks = [];
-    #lastWriteChunkTime = 0;
-    #writeTimeout = null;
+    #flushScheduled = false;
     req;
     constructor(res, req, app) {
         super();
@@ -157,33 +156,38 @@ module.exports = class Response extends Writable {
             }
     
             if (this.chunkedTransfer) {
+                // Workaround for uWS bug: calling res.write() in separate cork() callbacks
+                // produces corrupted HTTP chunked framing. We accumulate chunks and write them
+                // as a single concatenated buffer to avoid multiple write() calls across corks.
+                // See: https://github.com/uNetworking/uWebSockets.js/issues/1249
                 this.#pendingChunks.push(chunk);
-                const size = this.#pendingChunks.reduce((acc, chunk) => acc + chunk.byteLength, 0);
-                const now = performance.now();
-                // the first chunk is sent immediately (!this.#lastWriteChunkTime)
-                // the other chunks are sent when watermark is reached (size >= HIGH_WATERMARK) 
-                // or if elapsed 50ms of last send (now - this.#lastWriteChunkTime > 50)
-                if (!this.#lastWriteChunkTime || size >= HIGH_WATERMARK || now - this.#lastWriteChunkTime > 50) {
-                    this._res.write(Buffer.concat(this.#pendingChunks, size));
+                const size = this.#pendingChunks.reduce((acc, c) => acc + c.byteLength, 0);
+                if (size >= HIGH_WATERMARK) {
+                    const ok = this._res.write(Buffer.concat(this.#pendingChunks, size));
                     this.#pendingChunks = [];
-                    this.#lastWriteChunkTime = now;
-                    if(this.#writeTimeout) {
-                        clearTimeout(this.#writeTimeout);
-                        this.#writeTimeout = null;
+                    if (!ok) {
+                        this._res.onWritable(() => {
+                            if (this.aborted || this.finished) return true;
+                            this.writingChunk = false;
+                            callback(null);
+                            return true;
+                        });
+                        return;
                     }
-                } else if(!this.#writeTimeout) {
-                    this.#writeTimeout = setTimeout(() => {
-                        this.#writeTimeout = null;
-                        if(!this.finished && !this.aborted) this._res.cork(() => {
-                            if(this.#pendingChunks.length) {
-                                const size = this.#pendingChunks.reduce((acc, chunk) => acc + chunk.byteLength, 0);
-                                this._res.write(Buffer.concat(this.#pendingChunks, size));
+                }
+                if (!this.#flushScheduled) {
+                    this.#flushScheduled = true;
+                    setTimeout(() => {
+                        this.#flushScheduled = false;
+                        if (this.finished || this.aborted || !this.#pendingChunks.length) return;
+                        this._res.cork(() => {
+                            if (this.#pendingChunks.length) {
+                                const s = this.#pendingChunks.reduce((acc, c) => acc + c.byteLength, 0);
+                                this._res.write(Buffer.concat(this.#pendingChunks, s));
                                 this.#pendingChunks = [];
-                                this.#lastWriteChunkTime = performance.now();
                             }
                         });
                     }, 50);
-                    this.#writeTimeout.unref();
                 }
                 this.writingChunk = false;
                 callback(null);
@@ -313,9 +317,9 @@ module.exports = class Response extends Writable {
                 this._res.endWithoutBody(contentLength.toString());
             } else {
                 if(this.#pendingChunks.length) {
-                    this._res.write(Buffer.concat(this.#pendingChunks));
+                    const s = this.#pendingChunks.reduce((acc, c) => acc + c.byteLength, 0);
+                    this._res.write(Buffer.concat(this.#pendingChunks, s));
                     this.#pendingChunks = [];
-                    this.lastWriteChunkTime = 0;
                 }
                 if(data instanceof Buffer) {
                     data = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
